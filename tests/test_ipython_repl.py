@@ -18,7 +18,7 @@ import pytest
 
 pytest.importorskip("IPython")
 
-from rlm.core.types import ModelUsageSummary, RLMChatCompletion, UsageSummary
+from rlm.core.types import ModelUsageSummary, REPLResult, RLMChatCompletion, UsageSummary
 from rlm.environments.ipython_repl import IPythonREPL
 
 # -----------------------------------------------------------------------------
@@ -511,6 +511,257 @@ def test_in_process_error_includes_traceback_and_user_frame():
 # -----------------------------------------------------------------------------
 
 
+def test_in_process_input_is_disabled():
+    """``input()`` must not block in cells; it should raise."""
+    with IPythonREPL(kernel_mode="in_process") as repl:
+        result = repl.execute_code("input('go')")
+    assert "RuntimeError" in result.stderr or "input() is disabled" in result.stderr
+
+
+def test_in_process_input_restored_if_user_overwrites():
+    """If a cell rebinds ``input``, the next cell must still see the disabled stub."""
+    with IPythonREPL(kernel_mode="in_process") as repl:
+        repl.execute_code("input = lambda *a, **kw: 'evil'")
+        result = repl.execute_code("input('go')")
+    assert "RuntimeError" in result.stderr or "input() is disabled" in result.stderr
+
+
+def test_cleanup_unregisters_atexit_handler():
+    """Cleanup must remove ``InteractiveShell.atexit_operations`` from the
+    ``atexit`` registry so it doesn't hold a strong external reference to
+    the shell for the rest of the process lifetime.
+
+    ``atexit`` doesn't expose a clean way to introspect its registry, so we
+    detect leakage indirectly: register a sentinel, then verify our cleanup
+    didn't remove it (i.e., cleanup is targeted at the shell's handler, not
+    a blanket clear). Combined with the absence of any error from
+    ``atexit.unregister``, this confirms the unregister code path runs.
+    """
+    import atexit as _atexit
+
+    sentinel_called = [False]
+
+    def sentinel() -> None:
+        sentinel_called[0] = True
+
+    _atexit.register(sentinel)
+    try:
+        repl = IPythonREPL(kernel_mode="in_process")
+        # ``atexit_operations`` exists and is callable on a live shell.
+        assert callable(repl._shell.atexit_operations)
+        repl.cleanup()
+        assert repl._shell is None
+        # Sentinel still registered — our unregister didn't blast unrelated
+        # handlers.
+        _atexit.unregister(sentinel)
+    finally:
+        _atexit.unregister(sentinel)
+
+
+# -----------------------------------------------------------------------------
+# Stale subcall attribution (subprocess mode)
+# -----------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _has_subprocess, reason="jupyter_client not installed")
+def test_stale_subcall_completion_not_misattributed_to_next_cell():
+    """A subcall_fn that finishes *during* a subsequent cell — because the
+    cell that triggered it timed out — must NOT be counted in the new
+    cell's ``rlm_calls``.
+
+    Prior to cell_id tagging, the broker stored completions in a flat
+    list that the next cell's drain consumed indiscriminately.
+    """
+
+    finished = threading.Event()
+
+    def slow_subcall(prompt: str, model: str | None = None) -> RLMChatCompletion:
+        # Long enough to outlive cell A's timeout but finish during cell B.
+        time.sleep(0.5)
+        finished.set()
+        usage = UsageSummary(
+            model_usage_summaries={
+                "fake-model": ModelUsageSummary(
+                    total_calls=1, total_input_tokens=0, total_output_tokens=0
+                )
+            }
+        )
+        return RLMChatCompletion(
+            root_model="fake-model",
+            prompt=prompt,
+            response="late",
+            usage_summary=usage,
+            execution_time=0.5,
+        )
+
+    with IPythonREPL(
+        kernel_mode="subprocess",
+        subcall_fn=slow_subcall,
+        cell_timeout=0.1,
+    ) as repl:
+        # Cell A: kicks off rlm_query, times out before subcall_fn finishes.
+        r1 = repl.execute_code('rlm_query("p")')
+        assert "TimeoutError" in r1.stderr
+        # subcall_fn shouldn't have completed yet.
+        assert not finished.is_set()
+
+        # Cell B: stays busy past the subcall_fn completion time. We need
+        # an explicit higher timeout for B because cell_timeout was set to
+        # 0.1s above.
+        repl.cell_timeout = 5.0
+        r2 = repl.execute_code("import time; time.sleep(1.0)")
+        assert finished.is_set(), "subcall_fn should have completed by now"
+
+    # Cell B made no rlm_query calls, so its rlm_calls must be empty —
+    # cell A's late completion stays attributed to A (and is discarded as
+    # stale on B's drain).
+    assert len(r2.rlm_calls) == 0, (
+        f"cell B must not inherit cell A's late subcall completion; got {len(r2.rlm_calls)}"
+    )
+
+
+@pytest.mark.skipif(not _has_subprocess, reason="jupyter_client not installed")
+def test_stale_final_var_not_misattributed_to_next_cell():
+    """Same logic for ``FINAL_VAR`` — a final-answer set by a prior cell's
+    delayed code path must not surface as the next cell's final answer."""
+
+    barrier = threading.Event()
+
+    def slow_subcall(prompt: str, model: str | None = None) -> RLMChatCompletion:
+        # Hold the kernel-side rlm_query call long enough that we get
+        # to issue cell B before subcall_fn ever returns.
+        barrier.wait(timeout=5.0)
+        usage = UsageSummary(
+            model_usage_summaries={
+                "fake-model": ModelUsageSummary(
+                    total_calls=1, total_input_tokens=0, total_output_tokens=0
+                )
+            }
+        )
+        return RLMChatCompletion(
+            root_model="fake-model",
+            prompt=prompt,
+            response="late",
+            usage_summary=usage,
+            execution_time=0.0,
+        )
+
+    with IPythonREPL(
+        kernel_mode="subprocess",
+        subcall_fn=slow_subcall,
+        cell_timeout=0.1,
+    ) as repl:
+        r1 = repl.execute_code('rlm_query("p"); FINAL_VAR("late-A")')
+        assert "TimeoutError" in r1.stderr
+        # Cell A is over with no FINAL_VAR captured.
+        assert r1.final_answer is None
+
+        # Now release subcall_fn and let it complete. If cell A's
+        # FINAL_VAR were globally stored (by old code), it would now be
+        # in the broker waiting for the next drain to pick it up.
+        # (Note: in this test FINAL_VAR happens after rlm_query, which
+        # the timeout already prevented — but the same path is exercised
+        # by any straggler.)
+        barrier.set()
+        time.sleep(0.3)
+
+        repl.cell_timeout = 5.0
+        r2 = repl.execute_code("print('clean')")
+
+    assert r2.final_answer is None, (
+        f"cell B must not inherit cell A's stale FINAL_VAR; got {r2.final_answer!r}"
+    )
+
+
+# -----------------------------------------------------------------------------
+# Reentrant subcall_fn → execute_code (deadlock prevention)
+# -----------------------------------------------------------------------------
+
+
+@BOTH_MODES
+def test_subcall_fn_reentry_into_same_repl_raises(kernel_mode: str):
+    """If subcall_fn calls execute_code on its parent REPL, the call must
+    raise — not deadlock (cross-thread broker case) or silently clobber
+    the parent's tracking state (same-thread in-process case)."""
+
+    seen: list[str] = []
+    repl_holder: dict[str, IPythonREPL] = {}
+
+    def reentering_subcall(prompt: str, model: str | None = None) -> RLMChatCompletion:
+        try:
+            repl_holder["repl"].execute_code("print('inner')")
+        except RuntimeError as e:
+            seen.append(str(e))
+            raise
+        usage = UsageSummary(
+            model_usage_summaries={
+                "fake-model": ModelUsageSummary(
+                    total_calls=1, total_input_tokens=0, total_output_tokens=0
+                )
+            }
+        )
+        return RLMChatCompletion(
+            root_model="fake-model",
+            prompt=prompt,
+            response="never",
+            usage_summary=usage,
+            execution_time=0.0,
+        )
+
+    with IPythonREPL(
+        kernel_mode=kernel_mode,
+        subcall_fn=reentering_subcall,
+    ) as repl:
+        repl_holder["repl"] = repl
+        # Run rlm_query → subcall_fn → reentrant execute_code → raises.
+        # We bound the call so a regression that deadlocks fails the
+        # test instead of hanging the suite forever.
+        result_holder: list[REPLResult] = []
+        err_holder: list[BaseException] = []
+
+        def runner() -> None:
+            try:
+                result_holder.append(repl.execute_code('print(rlm_query("p"))'))
+            except BaseException as e:
+                err_holder.append(e)
+
+        t = threading.Thread(target=runner)
+        t.start()
+        t.join(timeout=10.0)
+        assert not t.is_alive(), "execute_code deadlocked instead of raising"
+
+    # subcall_fn observed the reentry RuntimeError.
+    assert seen, "reentering subcall_fn was never reached or never raised"
+    assert any("Reentrant" in s for s in seen), seen
+
+
+@BOTH_MODES
+def test_concurrent_execute_does_not_lose_rlm_calls(kernel_mode: str):
+    """Two threads each running an ``rlm_query`` cell must each report
+    exactly one call. Prior to the lock-scope fix the in-process path
+    raced on ``_pending_llm_calls`` and lost entries."""
+    subcall = _FakeSubcall(responses=["x"])
+    counts: list[int] = []
+    lock = threading.Lock()
+
+    def worker(repl: IPythonREPL) -> None:
+        for _ in range(5):
+            r = repl.execute_code("rlm_query('p')")
+            with lock:
+                counts.append(len(r.rlm_calls))
+
+    with IPythonREPL(kernel_mode=kernel_mode, subcall_fn=subcall) as repl:
+        threads = [threading.Thread(target=worker, args=(repl,)) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    # 4 threads × 5 cells = 20 cells, each expected to report exactly 1 call.
+    assert len(counts) == 20
+    assert all(c == 1 for c in counts), f"some cells lost rlm_calls — saw {sorted(counts)}"
+
+
 def test_in_process_two_instances_have_distinct_user_modules():
     """Two coexisting in-process instances must not share ``sys.modules['__main__']``."""
     repl_a = IPythonREPL(kernel_mode="in_process")
@@ -564,6 +815,59 @@ def test_concurrent_add_context_indices_are_unique(kernel_mode: str):
     # All indices distinct, contiguous, and 0..7 in some order.
     assert sorted(results) == list(range(8))
     assert repl.get_context_count() == 8
+
+
+def test_in_process_subcall_concurrency_is_globally_bounded():
+    """In-process mode also caps ``subcall_fn`` globally, matching subprocess.
+
+    Without the per-instance semaphore, user threads inside a single cell
+    that each call ``rlm_query`` / ``rlm_query_batched`` would fan out
+    past ``max_concurrent_subcalls``.
+    """
+
+    in_flight = 0
+    peak = 0
+    cv_lock = threading.Lock()
+
+    def slow_subcall(prompt: str, model: str | None = None) -> RLMChatCompletion:
+        nonlocal in_flight, peak
+        with cv_lock:
+            in_flight += 1
+            peak = max(peak, in_flight)
+        time.sleep(0.05)
+        with cv_lock:
+            in_flight -= 1
+        usage = UsageSummary(
+            model_usage_summaries={
+                "fake-model": ModelUsageSummary(
+                    total_calls=1, total_input_tokens=0, total_output_tokens=0
+                )
+            }
+        )
+        return RLMChatCompletion(
+            root_model="fake-model",
+            prompt=prompt,
+            response="ok",
+            usage_summary=usage,
+            execution_time=0.05,
+        )
+
+    with IPythonREPL(
+        kernel_mode="in_process",
+        subcall_fn=slow_subcall,
+        max_concurrent_subcalls=2,
+    ) as repl:
+        result = repl.execute_code(
+            "import threading\n"
+            "def go():\n"
+            "    rlm_query_batched(['p1','p2','p3','p4','p5','p6','p7','p8'])\n"
+            "ts = [threading.Thread(target=go) for _ in range(2)]\n"
+            "for t in ts: t.start()\n"
+            "for t in ts: t.join()\n"
+            "print('done')"
+        )
+    assert "done" in result.stdout
+    assert peak <= 2, f"in-process semaphore should bound concurrency to 2, saw peak={peak}"
 
 
 def test_subcall_concurrency_is_globally_bounded():

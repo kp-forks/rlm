@@ -17,6 +17,7 @@ Two kernel modes:
 
 from __future__ import annotations
 
+import atexit
 import copy
 import io
 import json
@@ -100,10 +101,12 @@ class _SubcallBroker:
 
     Reuses the 4-byte-length-prefix JSON protocol from ``rlm.core.comms_utils``.
 
-    Request types:
-        {"type": "subcall", "prompt": str, "model": str | None}
-        {"type": "subcall_batched", "prompts": [str], "model": str | None}
-        {"type": "final_var", "value": str}
+    Request types (all subcall/final_var requests carry a ``cell_id`` so
+    the parent can attribute completions to the cell that triggered them
+    even if ``subcall_fn`` finishes after that cell has timed out):
+        {"type": "subcall", "prompt": str, "model": str | None, "cell_id": str}
+        {"type": "subcall_batched", "prompts": [str], "model": str | None, "cell_id": str}
+        {"type": "final_var", "value": str, "cell_id": str}
 
     Responses:
         subcall:          {"completion": RLMChatCompletion.to_dict()} | {"error": str}
@@ -131,8 +134,11 @@ class _SubcallBroker:
         # only bound concurrency within a single batched request.
         self._subcall_semaphore = threading.Semaphore(max(1, max_concurrent))
         self._shutting_down = False
-        self.completions: list[RLMChatCompletion] = []
-        self.final_answer: str | None = None
+        # Indexed by ``cell_id`` so completions and final_answers from a
+        # subcall that finishes *after* its origin cell timed out don't
+        # get misattributed to a later cell.
+        self._completions_by_cell: dict[str, list[RLMChatCompletion]] = {}
+        self._final_answers_by_cell: dict[str, str] = {}
 
     def start(self) -> tuple[str, int]:
         parent = self
@@ -185,10 +191,12 @@ class _SubcallBroker:
         if self._shutting_down and req_type in ("subcall", "subcall_batched"):
             return {"error": "Broker shutting down"}
 
+        cell_id = data.get("cell_id") or ""
+
         if req_type == "final_var":
             value = data.get("value")
             with self._lock:
-                self.final_answer = str(value) if value is not None else None
+                self._final_answers_by_cell[cell_id] = str(value) if value is not None else ""
             return {"ok": True}
 
         if req_type == "subcall":
@@ -197,7 +205,7 @@ class _SubcallBroker:
             try:
                 completion = self._run_subcall(data.get("prompt", ""), data.get("model"))
                 with self._lock:
-                    self.completions.append(completion)
+                    self._completions_by_cell.setdefault(cell_id, []).append(completion)
                 return {"completion": completion.to_dict()}
             except Exception as e:
                 return {"error": f"{type(e).__name__}: {e}"}
@@ -232,8 +240,9 @@ class _SubcallBroker:
                     f.result()
 
             with self._lock:
+                bucket = self._completions_by_cell.setdefault(cell_id, [])
                 for _, c in sorted(local_completions, key=lambda t: t[0]):
-                    self.completions.append(c)
+                    bucket.append(c)
 
             return {
                 "responses": [
@@ -263,13 +272,29 @@ class _SubcallBroker:
             return (self.host, self._port)
         return (self.host, self._server.server_address[1])
 
-    def drain(self) -> tuple[list[RLMChatCompletion], str | None]:
-        """Atomically snapshot + clear completions and final_answer."""
+    def drain(self, cell_id: str | None = None) -> tuple[list[RLMChatCompletion], str | None]:
+        """Pop completions and the final answer for a cell, discard the rest.
+
+        ``drain(cell_id)`` returns this cell's completions+final and
+        unconditionally clears any entries belonging to *other* cells —
+        those are stragglers from a prior cell that timed out before its
+        own ``subcall_fn`` finished, and they must not bleed into a future
+        cell's bookkeeping.
+
+        ``drain(None)`` is a clear-all path with no return value (used as
+        a precaution when we don't have a cell_id, e.g. setup paths).
+        """
         with self._lock:
-            completions = self.completions.copy()
-            self.completions.clear()
-            final = self.final_answer
-            self.final_answer = None
+            if cell_id is None:
+                self._completions_by_cell.clear()
+                self._final_answers_by_cell.clear()
+                return [], None
+            completions = self._completions_by_cell.pop(cell_id, [])
+            final = self._final_answers_by_cell.pop(cell_id, None)
+            # Discard stragglers from other (now-defunct) cells so they
+            # don't get attributed to a later drain.
+            self._completions_by_cell.clear()
+            self._final_answers_by_cell.clear()
         return completions, final
 
 
@@ -295,6 +320,10 @@ def _build_kernel_bootstrap(
         _RLM_SUBCALL_ADDRESS = {list(subcall_address) if subcall_address else None!r}
         _RLM_DEPTH = {depth}
         _RLM_SUBCALL_TIMEOUT = {subcall_timeout!r}
+        # Updated by the parent before each user cell. Tagged onto every
+        # broker request so completions / FINAL_VAR answers can be
+        # attributed to the cell that originated them.
+        _RLM_CURRENT_CELL = ""
 
         def _rlm_socket_send(sock, data):
             payload = _rlm_json.dumps(data).encode("utf-8")
@@ -357,7 +386,8 @@ def _build_kernel_bootstrap(
             if _RLM_SUBCALL_ADDRESS is None:
                 return llm_query(prompt, model=model)
             resp = _rlm_request(_RLM_SUBCALL_ADDRESS, {{
-                "type": "subcall", "prompt": prompt, "model": model
+                "type": "subcall", "prompt": prompt, "model": model,
+                "cell_id": _RLM_CURRENT_CELL,
             }})
             if not isinstance(resp, dict):
                 return "Error: RLM query failed - malformed response"
@@ -374,7 +404,8 @@ def _build_kernel_bootstrap(
             if _RLM_SUBCALL_ADDRESS is None:
                 return llm_query_batched(prompts, model=model)
             resp = _rlm_request(_RLM_SUBCALL_ADDRESS, {{
-                "type": "subcall_batched", "prompts": prompts, "model": model
+                "type": "subcall_batched", "prompts": prompts, "model": model,
+                "cell_id": _RLM_CURRENT_CELL,
             }})
             if not isinstance(resp, dict):
                 return ["Error: RLM query failed - malformed response"] * len(prompts)
@@ -387,13 +418,19 @@ def _build_kernel_bootstrap(
         def FINAL_VAR(variable):
             if not isinstance(variable, str):
                 answer = str(variable)
-                _rlm_request(_RLM_SUBCALL_ADDRESS, {{"type": "final_var", "value": answer}})
+                _rlm_request(_RLM_SUBCALL_ADDRESS, {{
+                    "type": "final_var", "value": answer,
+                    "cell_id": _RLM_CURRENT_CELL,
+                }})
                 return answer
             name = variable.strip().strip('"\\'')
             ns = get_ipython().user_ns
             if name in ns:
                 answer = str(ns[name])
-                _rlm_request(_RLM_SUBCALL_ADDRESS, {{"type": "final_var", "value": answer}})
+                _rlm_request(_RLM_SUBCALL_ADDRESS, {{
+                    "type": "final_var", "value": answer,
+                    "cell_id": _RLM_CURRENT_CELL,
+                }})
                 return answer
             skip = {{"In", "Out", "exit", "quit", "get_ipython"}}
             available = [
@@ -533,6 +570,19 @@ class IPythonREPL(NonIsolatedEnv):
         # invoking ``execute_code`` (which re-acquires it) so the
         # index→assign→count-increment sequence stays atomic across threads.
         self._lock = threading.RLock()
+        # Global cap on concurrent ``subcall_fn`` invocations from in-process
+        # mode (subprocess has the equivalent inside ``_SubcallBroker``). A
+        # cell that spawns user threads each calling ``rlm_query`` would
+        # otherwise blow past ``max_concurrent_subcalls``.
+        self._inprocess_subcall_semaphore = threading.Semaphore(max(1, max_concurrent_subcalls))
+        # Tracks threads currently *inside* a ``subcall_fn`` invocation
+        # (in-process directly, or subprocess via the broker handler).
+        # ``execute_code`` checks this set to fail fast if subcall_fn calls
+        # back into this REPL — that would either deadlock the cell lock
+        # (cross-thread broker reentry) or corrupt this cell's tracking
+        # state (same-thread reentry).
+        self._subcall_threads: set[int] = set()
+        self._subcall_threads_lock = threading.Lock()
         self._context_count: int = 0
         self._history_count: int = 0
 
@@ -626,6 +676,7 @@ class IPythonREPL(NonIsolatedEnv):
         ns["rlm_query_batched"] = self._rlm_query_batched
         ns["FINAL_VAR"] = self._final_var
         ns["SHOW_VARS"] = self._show_vars
+        ns["input"] = self._disabled_input
 
         # Inject custom tools
         for name, entry in self.custom_tools.items():
@@ -641,9 +692,16 @@ class IPythonREPL(NonIsolatedEnv):
                 "or pip install jupyter_client ipykernel"
             ) from e
 
-        # Start broker first so we know its address before bootstrapping kernel
+        # Start broker first so we know its address before bootstrapping
+        # kernel. Wrap subcall_fn in ``_tracked_subcall`` so the broker's
+        # handler threads register themselves as subcall threads — that's
+        # what ``execute_code``'s reentry check uses to detect a deadlock
+        # (subcall_fn calling back into the parent REPL).
+        broker_subcall_fn: Callable[[str, str | None], RLMChatCompletion] | None = (
+            self._tracked_subcall if self.subcall_fn is not None else None
+        )
         self._broker = _SubcallBroker(
-            subcall_fn=self.subcall_fn,
+            subcall_fn=broker_subcall_fn,
             max_concurrent=self.max_concurrent_subcalls,
         )
         self._broker.start()
@@ -771,6 +829,19 @@ class IPythonREPL(NonIsolatedEnv):
             f"You must create and assign a variable in a REPL block BEFORE calling FINAL_VAR on it."
         )
 
+    @staticmethod
+    def _disabled_input(*_args: Any, **_kwargs: Any) -> str:
+        """Replacement for ``input()`` injected into in-process user_ns.
+
+        ``input()`` would block on the parent process's stdin if a cell
+        called it (the LLM is unattended). Subprocess mode disables stdin
+        via ``allow_stdin=False``; this is the in-process equivalent.
+
+        User code that calls ``builtins.input`` directly bypasses this
+        shadow — the shadow only catches the common unqualified call.
+        """
+        raise RuntimeError("input() is disabled in IPythonREPL: cells cannot prompt for stdin")
+
     def _show_vars(self) -> str:
         ns = self._shell.user_ns if self._shell is not None else {}
         available = {
@@ -813,11 +884,40 @@ class IPythonREPL(NonIsolatedEnv):
         except Exception as e:
             return [f"Error: LM query failed - {e}"] * len(prompts)
 
+    def _tracked_subcall(self, prompt: str, model: str | None) -> RLMChatCompletion:
+        """Invoke ``self.subcall_fn`` and register the calling thread.
+
+        ``execute_code`` consults the registered set to detect reentry
+        (subcall_fn calling back into this same REPL) and fail with a
+        clear error instead of deadlocking the cell lock or silently
+        clobbering tracking state.
+        """
+        assert self.subcall_fn is not None
+        cur = threading.get_ident()
+        with self._subcall_threads_lock:
+            self._subcall_threads.add(cur)
+        try:
+            return self.subcall_fn(prompt, model)
+        finally:
+            with self._subcall_threads_lock:
+                self._subcall_threads.discard(cur)
+
+    def _run_inprocess_subcall(self, prompt: str, model: str | None) -> RLMChatCompletion:
+        """Invoke ``subcall_fn`` under the per-instance semaphore.
+
+        Globally bounds in-flight calls across nested rlm_query /
+        rlm_query_batched invocations spawned from user threads inside a
+        single cell. Mirrors the ``_SubcallBroker._run_subcall`` gate used
+        in subprocess mode.
+        """
+        with self._inprocess_subcall_semaphore:
+            return self._tracked_subcall(prompt, model)
+
     def _rlm_query(self, prompt: str, model: str | None = None) -> str:
         if self.subcall_fn is None:
             return self._llm_query(prompt, model)
         try:
-            completion = self.subcall_fn(prompt, model)
+            completion = self._run_inprocess_subcall(prompt, model)
             self._pending_llm_calls.append(completion)
             return completion.response
         except Exception as e:
@@ -831,7 +931,7 @@ class IPythonREPL(NonIsolatedEnv):
             results: list[str] = []
             for prompt in prompts:
                 try:
-                    completion = self.subcall_fn(prompt, model)
+                    completion = self._run_inprocess_subcall(prompt, model)
                     self._pending_llm_calls.append(completion)
                     results.append(completion.response)
                 except Exception as e:
@@ -845,7 +945,10 @@ class IPythonREPL(NonIsolatedEnv):
 
         def _run(index: int, prompt: str) -> None:
             try:
-                completion = self.subcall_fn(prompt, model)  # type: ignore[misc]
+                # Semaphore-gated so that multiple in-flight batched calls
+                # (e.g., from user-spawned threads inside the cell) share
+                # the global concurrency budget.
+                completion = self._run_inprocess_subcall(prompt, model)
                 with lock:
                     completions.append((index, completion))
                 results[index] = completion.response
@@ -983,13 +1086,30 @@ class IPythonREPL(NonIsolatedEnv):
     # -------------------------------------------------------------------------
 
     def execute_code(self, code: str) -> REPLResult:
+        # Reentry guard: if the caller's thread is currently inside this
+        # REPL's ``subcall_fn`` (in-process synchronously, or subprocess
+        # via the broker handler thread), calling ``execute_code`` would
+        # either deadlock the cell lock (cross-thread broker reentry) or
+        # silently corrupt the in-flight cell's tracking (same-thread
+        # in-process reentry). Fail fast with a clear message.
+        cur = threading.get_ident()
+        with self._subcall_threads_lock:
+            is_reentrant = cur in self._subcall_threads
+        if is_reentrant:
+            raise RuntimeError(
+                "Reentrant execute_code on the same instance from inside "
+                "subcall_fn is not supported — it would deadlock or "
+                "clobber the parent cell's bookkeeping. subcall_fn must "
+                "spawn a child REPL (with its own lock) instead of "
+                "calling back into its parent."
+            )
+
         if self.kernel_mode == "in_process":
             return self._execute_in_process(code)
         return self._execute_in_kernel(code, timeout=self.cell_timeout, drain_broker=True)
 
     def _execute_in_process(self, code: str) -> REPLResult:
         start_time = time.perf_counter()
-        self._pending_llm_calls = []
 
         stdout_buf = io.StringIO()
         stderr_buf = io.StringIO()
@@ -1010,6 +1130,12 @@ class IPythonREPL(NonIsolatedEnv):
         prev_timer: tuple[float, float] | None = None
 
         with self._lock, self._temp_cwd():
+            # Reset scratch state under the lock — otherwise a concurrent
+            # ``execute_code`` call from another thread would clobber the
+            # in-flight cell's bookkeeping.
+            self._pending_llm_calls = []
+            self._last_final_answer = None
+
             if use_alarm:
                 prev_handler = signal.signal(signal.SIGALRM, _alarm_handler)
                 prev_timer = signal.setitimer(signal.ITIMER_REAL, timeout)
@@ -1022,11 +1148,16 @@ class IPythonREPL(NonIsolatedEnv):
                         result = None
             finally:
                 if use_alarm:
-                    # Clear the pending alarm before restoring the handler, or
-                    # a late-firing SIGALRM could escape into unrelated code.
+                    # Order matters: install SIG_IGN *first* so any alarm
+                    # already queued for delivery is dropped instead of
+                    # raising TimeoutError out of cleanup code or unrelated
+                    # parent frames. Then disable the timer, then restore.
+                    signal.signal(signal.SIGALRM, signal.SIG_IGN)
                     signal.setitimer(signal.ITIMER_REAL, 0)
-                    if prev_handler is not None:
-                        signal.signal(signal.SIGALRM, prev_handler)
+                    signal.signal(
+                        signal.SIGALRM,
+                        prev_handler if prev_handler is not None else signal.SIG_DFL,
+                    )
                     # Restore any previously-scheduled timer the caller had set.
                     if prev_timer and prev_timer[0] > 0:
                         signal.setitimer(signal.ITIMER_REAL, *prev_timer)
@@ -1059,15 +1190,19 @@ class IPythonREPL(NonIsolatedEnv):
                 if not k.startswith("_") and k not in _IPYTHON_INTERNAL_NAMES
             }
 
-        final_answer = self._last_final_answer
-        self._last_final_answer = None
+            # Snapshot bookkeeping under the lock too — reading and clearing
+            # outside lets a concurrent thread overwrite/wipe the state we're
+            # about to report.
+            final_answer = self._last_final_answer
+            self._last_final_answer = None
+            rlm_calls = self._pending_llm_calls.copy()
 
         return REPLResult(
             stdout=stdout_buf.getvalue(),
             stderr=stderr_buf.getvalue(),
             locals=locals_snapshot,
             execution_time=time.perf_counter() - start_time,
-            rlm_calls=self._pending_llm_calls.copy(),
+            rlm_calls=rlm_calls,
             final_answer=final_answer,
         )
 
@@ -1101,12 +1236,33 @@ class IPythonREPL(NonIsolatedEnv):
     ) -> REPLResult:
         start_time = time.perf_counter()
 
-        # If a previous cell timed out mid-subcall, ``subcall_fn`` may have
-        # finished after we drained, leaving stragglers in the broker.
-        # Discard them so they aren't misattributed to *this* cell.
-        if drain_broker:
-            assert self._broker is not None
-            self._broker.drain()
+        # Generate a unique cell_id so the broker can attribute every
+        # subcall completion / FINAL_VAR answer to *this* cell. A subcall
+        # whose ``subcall_fn`` finishes after this cell times out will
+        # land under this id and stay there until the next drain (which
+        # discards it as stale).
+        cell_id = uuid.uuid4().hex if drain_broker else None
+
+        if cell_id is not None:
+            # Set the kernel-side ``_RLM_CURRENT_CELL`` via a separate
+            # ``execute_interactive`` call rather than prepending to the
+            # user's code — prepending would push cell magics
+            # (``%%magic``, which must be on line 1) off the first line
+            # and break them.
+            try:
+                self._kc.execute_interactive(
+                    f"_RLM_CURRENT_CELL = {cell_id!r}",
+                    timeout=self.startup_timeout,
+                    output_hook=lambda _msg: None,
+                    store_history=False,
+                    stop_on_error=False,
+                    allow_stdin=False,
+                )
+            except TimeoutError as e:
+                # Setter shouldn't time out under any sane condition; if
+                # it does, surface the failure rather than silently
+                # mis-attributing this cell's subcalls.
+                raise RuntimeError(f"Failed to set cell_id in kernel: {e}") from e
 
         stdout_parts: list[str] = []
         stderr_parts: list[str] = []
@@ -1167,11 +1323,13 @@ class IPythonREPL(NonIsolatedEnv):
             else:
                 stderr_parts.append(f"\n{ename}: {evalue}")
 
-        # Drain broker state (rlm_query completions, FINAL_VAR answer) only on
-        # user-facing cells. ``rlm_calls`` reports what was made *during this
-        # cell* — never accumulate across cells.
+        # Drain broker state (rlm_query completions, FINAL_VAR answer)
+        # *for this cell only*. Stragglers from prior timed-out cells live
+        # under their own cell_id; ``drain(cell_id)`` discards them rather
+        # than attributing them to this cell.
         if drain_broker:
-            completions, final_answer = self._broker.drain()
+            assert cell_id is not None
+            completions, final_answer = self._broker.drain(cell_id)
         else:
             completions, final_answer = [], None
 
@@ -1198,6 +1356,7 @@ class IPythonREPL(NonIsolatedEnv):
         ns["rlm_query_batched"] = self._rlm_query_batched
         ns["FINAL_VAR"] = self._final_var
         ns["SHOW_VARS"] = self._show_vars
+        ns["input"] = self._disabled_input
         if "context_0" in ns:
             ns["context"] = ns["context_0"]
         if "history_0" in ns:
@@ -1269,6 +1428,15 @@ class IPythonREPL(NonIsolatedEnv):
                 self._broker = None
 
         if self._shell is not None:
+            # IPython's ``InteractiveShell.__init__`` registers
+            # ``atexit_operations`` with the ``atexit`` module, which holds
+            # a strong reference to the shell for the rest of the process.
+            # Unregister so the shell (and its user_module / history mgr)
+            # become collectable when we drop our reference.
+            try:
+                atexit.unregister(self._shell.atexit_operations)
+            except Exception:
+                pass
             try:
                 self._shell.reset(new_session=False)
             except Exception:
