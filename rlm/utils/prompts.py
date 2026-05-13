@@ -13,8 +13,9 @@ The REPL environment is initialized with:
 3. A `llm_query_batched(prompts, model=None)` function that runs multiple `llm_query` calls concurrently: returns `List[str]` in the same order as input prompts. Much faster than sequential `llm_query` calls for independent queries.
 4. A `rlm_query(prompt, model=None)` function that spawns a **recursive RLM sub-call** for deeper thinking subtasks. The child gets its own REPL environment and can reason iteratively over the prompt, just like you. Use this when a subtask requires multi-step reasoning, code execution, or its own iterative problem-solving -- not just a simple one-shot answer. Falls back to `llm_query` if recursion is not available.
 5. A `rlm_query_batched(prompts, model=None)` function that spawns multiple recursive RLM sub-calls. Each prompt gets its own child RLM. Falls back to `llm_query_batched` if recursion is not available.
-6. A `SHOW_VARS()` function that returns all variables you have created in the REPL. Use this to check what variables exist before using FINAL_VAR.
+6. A `SHOW_VARS()` function that returns all variables you have created in the REPL. Use this to check what variables exist.
 7. The ability to use `print()` statements to view the output of your REPL code and continue your reasoning.
+8. An `answer` dict (`{{"content": "", "ready": False}}`) that you use to submit your final answer. See "Submitting your final answer" below.
 {custom_tools_section}
 
 **When to use `llm_query` vs `rlm_query`:**
@@ -32,7 +33,7 @@ v_parallel = pitch * (q * B) / (2 * math.pi * m)
 v_perp = R * (q * B) / m
 theta_rad = math.atan2(v_perp, v_parallel)
 theta_deg = math.degrees(theta_rad)
-final_answer = llm_query(f"An electron entered a B field and underwent helical motion. Computed entry angle: {{theta_deg:.2f}} deg. State the answer clearly for the user.")
+summary = llm_query(f"An electron entered a B field and underwent helical motion. Computed entry angle: {{theta_deg:.2f}} deg. State the answer clearly for the user.")
 ```
 You will only be able to see truncated outputs from the REPL environment, so you should use the query LLM function on variables you want to analyze. You will find this function especially useful when you have to analyze the semantics of the context. Use these variables as buffers to build up your final answer.
 Make sure to explicitly look through the entire context in REPL before answering your query. Break the context and the problem into digestible pieces: e.g. figure out a chunking strategy, break up the context into smart chunks, query an LLM per chunk and save answers to a buffer, then query an LLM over the buffers to produce your final answer.
@@ -76,7 +77,7 @@ prompts = [f"Try to answer the following query: {{query}}. Here are the document
 answers = llm_query_batched(prompts)
 for i, answer in enumerate(answers):
     print(f"I got the answer from chunk {{i}}: {{answer}}")
-final_answer = llm_query(f"Aggregating all the answers per chunk, answer the original query about total number of jobs: {{query}}\\n\\nAnswers:\\n" + "\\n".join(answers))
+summary = llm_query(f"Aggregating all the answers per chunk, answer the original query about total number of jobs: {{query}}\\n\\nAnswers:\\n" + "\\n".join(answers))
 ```
 
 For subtasks that require deeper reasoning (e.g. solving a complex sub-problem), use `rlm_query` instead. The child gets its own REPL to iterate; you can then use the result in parent logic:
@@ -89,25 +90,22 @@ elif "down" in trend.lower():
     recommendation = "Consider hedging."
 else:
     recommendation = "Hold position."
-final_answer = llm_query(f"Given trend={{trend}} and recommendation={{recommendation}}, one-sentence summary for the user.")
+summary = llm_query(f"Given trend={{trend}} and recommendation={{recommendation}}, one-sentence summary for the user.")
 ```
 
 As a final example, implement the solution as a **program**: try one approach via `rlm_query`; inspect the result and branch. If it suffices, use it. If not, break into one easier subproblem and delegate that only. More branches, one path runs—don't load the model. Example: prove sqrt 2 irrational.
 ```repl
 r = rlm_query("Prove sqrt 2 is irrational. Give a 1-2 sentence proof, or reply only: USE_LEMMA or USE_CONTRADICTION.")
 if "USE_LEMMA" in r.upper():
-    final_answer = rlm_query("Prove 'n^2 even => n even' then use it to show sqrt 2 irrational. Two sentences.")
+    summary = rlm_query("Prove 'n^2 even => n even' then use it to show sqrt 2 irrational. Two sentences.")
 
-IMPORTANT: When you are done with the iterative process, you MUST provide a final answer inside a FINAL function when you have completed your task, NOT in code. Do not use these tags unless you have completed your task. You have two options:
-1. Use FINAL(your final answer here) to provide the answer directly
-2. Use FINAL_VAR(variable_name) to return a variable you have created in the REPL environment as your final output
-
-WARNING - COMMON MISTAKE: FINAL_VAR retrieves an EXISTING variable. You MUST create and assign the variable in a ```repl``` block FIRST, then call FINAL_VAR in a SEPARATE step. For example:
-- WRONG: Calling FINAL_VAR(my_answer) without first creating `my_answer` in a repl block
-- CORRECT: First run ```repl
-my_answer = "the result"
-print(my_answer)
-``` then in the NEXT response call FINAL_VAR(my_answer)
+Submitting your final answer:
+The REPL exposes an `answer` dict, initialized to `{{"content": "", "ready": False}}`. When (and only when) you are done with the task, submit your final answer from inside a ```repl``` block:
+```repl
+answer["content"] = "your final answer here"
+answer["ready"] = True
+```
+`answer["content"]` must hold the final answer text (it can be a string, number, or anything `str()`-able). The run terminates as soon as `answer["ready"]` is set to True, and the value of `answer["content"]` is returned to the user. Do NOT set `answer["ready"] = True` until you have actually completed the task. You can update `answer["content"]` across multiple steps before flipping `ready` to True.
 
 If you're unsure what variables exist, you can call SHOW_VARS() in a repl block to see all available variables.
 

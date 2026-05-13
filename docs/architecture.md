@@ -37,7 +37,7 @@ An RLM completion involves three cooperating pieces:
 │     b. Extract ```repl``` code blocks from response            │
 │     c. Execute code in LocalREPL                               │
 │     d. Append stdout/stderr to message history                 │
-│     e. Repeat until FINAL_VAR / FINAL or limits exceeded       │
+│     e. Repeat until answer["ready"] is True or limits exceeded │
 │  4. Tear down handler and environment                          │
 └────────────────────────────────────────────────────────────────┘
 ```
@@ -139,7 +139,6 @@ globals (shared across all executions):
 ├── llm_query_batched() → batched plain LM calls
 ├── rlm_query()         → recursive RLM sub-call (or fallback to llm_query)
 ├── rlm_query_batched() → batched recursive sub-calls
-├── FINAL_VAR()         → mark a variable as the final answer
 ├── SHOW_VARS()         → list user-created variables
 └── <custom_tools>      → user-provided callable tools
 
@@ -148,6 +147,7 @@ locals (accumulates user variables):
 ├── context_0           → first context payload
 ├── context_1, …        → additional contexts (persistent mode)
 ├── history             → conversation history (persistent/compaction mode)
+├── answer              → {"content": "", "ready": False}; set ready=True to finish
 └── <user variables>    → anything created by model code
 ```
 
@@ -333,13 +333,13 @@ RLM (depth=0)
  │       │           │   │
  │       │           │   └─ llm_query() → TCP to Handler #2 → LM API → response
  │       │           │
- │       │           ├─ Child iteration 2: LM calls FINAL_VAR(result)
+ │       │           ├─ Child iteration 2: LM sets answer["content"]=result, answer["ready"]=True
  │       │           │
  │       │           └─ Returns RLMChatCompletion to parent
  │       │
- │       └─ answer = child_completion.response
+ │       └─ child_response = child_completion.response
  │
- ├─ Iteration 2: LM uses answer, calls FINAL_VAR(final)
+ ├─ Iteration 2: LM uses child_response, sets answer["content"]=final, answer["ready"]=True
  │
  ├─ LMHandler #1 stops
  └─ Returns RLMChatCompletion to user

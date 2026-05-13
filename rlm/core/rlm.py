@@ -26,7 +26,6 @@ from rlm.utils.exceptions import (
 )
 from rlm.utils.parsing import (
     find_code_blocks,
-    find_final_answer,
     format_iteration,
 )
 from rlm.utils.prompts import (
@@ -351,17 +350,14 @@ class RLM:
                     # Check error/budget/token limits after each iteration
                     self._check_iteration_limits(iteration, i, lm_handler)
 
-                    # Check if RLM is done and has a final answer.
-                    # Prefer FINAL_VAR result from REPL execution.
+                    # The REPL signals completion by populating
+                    # ``answer["content"]`` and setting ``answer["ready"] = True``.
+                    # Each environment surfaces that on ``REPLResult.final_answer``.
                     final_answer = None
                     for block in iteration.code_blocks:
-                        if getattr(block.result, "final_answer", None):
+                        if getattr(block.result, "final_answer", None) is not None:
                             final_answer = block.result.final_answer
                             break
-                    if final_answer is None:
-                        final_answer = find_final_answer(
-                            iteration.response, environment=environment
-                        )
                     iteration.final_answer = final_answer
 
                     # Store as best partial answer (most recent response with content)
