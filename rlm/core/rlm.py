@@ -206,9 +206,16 @@ class RLM:
 
         lm_handler = LMHandler(client, other_backend_client=other_backend_client)
 
-        # Register other clients to be available as sub-call options (by model name)
-        if self.other_backends and self.other_backend_kwargs:
-            for backend, kwargs in zip(self.other_backends, self.other_backend_kwargs, strict=True):
+        # Register other clients to be available as sub-call options (by model name).
+        # Reuse other_backend_client for the first entry so each (backend, kwargs)
+        # pair is instantiated exactly once.
+        if other_backend_client is not None:
+            lm_handler.register_client(other_backend_client.model_name, other_backend_client)
+            for backend, kwargs in zip(
+                self.other_backends[1:],
+                self.other_backend_kwargs[1:],
+                strict=True,
+            ):
                 other_client: BaseLM = get_client(backend, kwargs)
                 lm_handler.register_client(other_client.model_name, other_client)
 
