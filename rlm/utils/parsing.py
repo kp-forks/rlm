@@ -3,12 +3,8 @@ Parsing utilities for RLM trjaectories.
 """
 
 import re
-from typing import TYPE_CHECKING
 
 from rlm.core.types import REPLResult, RLMIteration
-
-if TYPE_CHECKING:
-    from rlm.environments.base_env import BaseEnv
 
 
 def find_code_blocks(text: str) -> list[str]:
@@ -24,50 +20,6 @@ def find_code_blocks(text: str) -> list[str]:
         results.append(code_content)
 
     return results
-
-
-def find_final_answer(text: str, environment: "BaseEnv | None" = None) -> str | None:
-    """
-    Find FINAL(...) or FINAL_VAR(...) statement in response and return the final answer string.
-
-    If FINAL_VAR is found and an environment is provided, executes code to retrieve the variable value.
-    Returns None if neither pattern is found.
-
-    Args:
-        text: The response text to parse
-        environment: Optional environment to execute code for FINAL_VAR retrieval
-
-    Returns:
-        The final answer string, or None if no final answer pattern is found
-    """
-    # Check for FINAL_VAR pattern first - must be at start of line
-    final_var_pattern = r"^\s*FINAL_VAR\((.*?)\)"
-    match = re.search(final_var_pattern, text, re.MULTILINE | re.DOTALL)
-    if match:
-        variable_name = match.group(1).strip().strip('"').strip("'")
-        if environment is not None:
-            result = environment.execute_code(f"print(FINAL_VAR({variable_name!r}))")
-            final_answer = result.stdout.strip()
-            if final_answer == "":
-                return None
-            # Don't treat FINAL_VAR "variable not found" as final answer (so RLM continues)
-            if (
-                "Variable '" in final_answer
-                and "' not found" in final_answer
-                and "FINAL_VAR" in final_answer
-            ):
-                return None
-            return final_answer
-        return None
-
-    # Check for FINAL pattern - must be at start of line
-    # Use greedy matching to capture content with nested parentheses
-    final_pattern = r"^\s*FINAL\((.*)\)\s*$"
-    match = re.search(final_pattern, text, re.MULTILINE | re.DOTALL)
-    if match:
-        return match.group(1).strip()
-
-    return None
 
 
 def format_iteration(
@@ -141,12 +93,6 @@ def format_execution_result(result: REPLResult) -> str:
         result_parts.append(f"REPL variables: {list(important_vars.keys())}\n")
 
     return "\n\n".join(result_parts) if result_parts else "No output"
-
-
-def check_for_final_answer(response: str, repl_env, logger) -> str | None:
-    """Check if response contains a final answer."""
-    # Use the new find_final_answer function which handles both FINAL and FINAL_VAR
-    return find_final_answer(response, environment=repl_env)
 
 
 def convert_context_for_repl(context):

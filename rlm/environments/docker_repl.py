@@ -140,22 +140,17 @@ def save_state(s):
 
 _locals = load_state()
 
-def FINAL_VAR(name):
-    name = name.strip().strip("\\"\\'")
-    if name in _locals:
-        return str(_locals[name])
-    available = [k for k in _locals.keys() if not k.startswith("_")]
-    if available:
-        return f"Error: Variable '{{name}}' not found. Available variables: {{available}}. You must create and assign a variable BEFORE calling FINAL_VAR on it."
-    return f"Error: Variable '{{name}}' not found. No variables have been created yet. You must create and assign a variable in a REPL block BEFORE calling FINAL_VAR on it."
+# Default answer dict on the first invocation; preserved across calls via state.
+if "answer" not in _locals or not isinstance(_locals.get("answer"), dict):
+    _locals["answer"] = {{"content": "", "ready": False}}
 
 def SHOW_VARS():
-    available = {{k: type(v).__name__ for k, v in _locals.items() if not k.startswith("_")}}
+    available = {{k: type(v).__name__ for k, v in _locals.items() if not k.startswith("_") and k != "answer"}}
     if not available:
         return "No variables created yet. Use ```repl``` blocks to create variables."
     return f"Available variables: {{available}}"
 
-_globals = {{"__builtins__": __builtins__, "__name__": "__main__", "llm_query": llm_query, "llm_query_batched": llm_query_batched, "FINAL_VAR": FINAL_VAR, "SHOW_VARS": SHOW_VARS}}
+_globals = {{"__builtins__": __builtins__, "__name__": "__main__", "llm_query": llm_query, "llm_query_batched": llm_query_batched, "SHOW_VARS": SHOW_VARS}}
 
 code = base64.b64decode("{code_b64}").decode()
 stdout_buf, stderr_buf = io.StringIO(), io.StringIO()
@@ -180,7 +175,11 @@ if "history_0" in _locals:
     _locals["history"] = _locals["history_0"]
 
 save_state(_locals)
-print(json.dumps({{"stdout": stdout_buf.getvalue(), "stderr": stderr_buf.getvalue(), "locals": {{k: repr(v) for k, v in _locals.items() if not k.startswith("_")}}}}, ensure_ascii=False))
+_ans = _locals.get("answer") if isinstance(_locals.get("answer"), dict) else None
+_final = None
+if _ans is not None and _ans.get("ready"):
+    _final = str(_ans.get("content", ""))
+print(json.dumps({{"stdout": stdout_buf.getvalue(), "stderr": stderr_buf.getvalue(), "locals": {{k: repr(v) for k, v in _locals.items() if not k.startswith("_")}}, "final_answer": _final}}, ensure_ascii=False))
 '''
     )
 
@@ -320,6 +319,7 @@ class DockerREPL(NonIsolatedEnv):
                 locals=data.get("locals", {}),
                 execution_time=time.perf_counter() - start,
                 rlm_calls=calls,
+                final_answer=data.get("final_answer"),
             )
         except json.JSONDecodeError:
             return REPLResult(
